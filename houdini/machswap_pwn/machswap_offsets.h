@@ -1,10 +1,14 @@
-#ifndef OFFSETS_H
-#define OFFSETS_H
+#ifndef MACHSWAP_OFFSETS_H
+#define MACHSWAP_OFFSETS_H
 
 typedef struct {
     struct {
         /* strings kernel | grep 'Darwin' */
-        const char *version;
+        const char *release;
+        
+        cpu_type_t cpu_type;
+        /* CPU_SUBTYPE for supported */
+        cpu_subtype_t cpu_subtype;
         
         /* basically will always be: 0xfffffff007004000 */
         uint64_t kernel_image_base;
@@ -91,8 +95,8 @@ typedef struct {
          */
         uint32_t get_external_trap_for_index;
     } iosurface;
-} offsets_t;
+} machswap_offsets_t;
 
-offsets_t *get_offsets(void);
+machswap_offsets_t *get_machswap_offsets(void);
 
 #endif
