@@ -48,8 +48,6 @@ extern NSMutableArray *sources_list;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    
-    
 }
 
 - (void) viewDidAppear:(BOOL)animated {
@@ -59,7 +57,7 @@ extern NSMutableArray *sources_list;
     
     UIAlertController * alert = [UIAlertController
                                  alertControllerWithTitle:@"Warning"
-                                 message:@"Packages has been disabled on HoudiniX until we verify a few things, stay tuned for an update!"
+                                 message:@"Sources has been disabled on HoudiniX until we fix a few things, stay tuned for an update!"
                                  preferredStyle:UIAlertControllerStyleAlert];
     
     UIAlertAction* confirmButton = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
@@ -135,7 +133,7 @@ extern NSMutableArray *sources_list;
     [self.reloadButton setHidden:YES];
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        sources_control_init();
+        //sources_control_init();
     });
 }
 

@@ -14,6 +14,7 @@
 #include "async_wake_strategy.h"
 #include "multi_path_strategy.h"
 #include "empty_list_strategy.h"
+#include "machswap/pwn.h"
 #include "machswap_strategy.h"
 #include "machswap_pwn_strategy.h"
 #include "strategy_control.h"
@@ -71,15 +72,13 @@ kern_return_t set_exploit_strategy() {
         return KERN_SUCCESS;
     }
     else if ([machswap_versions containsObject:system_version]) {
-        if ([machswap_pwn_devices containsObject:platform]) {
-            printf("[INFO]: chose machswap_pwn!\n");
-            chosen_strategy = _machswap_pwn_strategy();
-            return KERN_SUCCESS;
-        } else {
-            printf("[INFO]: chose machswap2!\n");
-            chosen_strategy = _machswap_strategy();
-            return KERN_SUCCESS;
-        }
+        printf("[INFO]: chose machswap!\n");
+        chosen_strategy = _machswap_strategy(); //chosen_strategy = _machswap_strategy();
+        return KERN_SUCCESS;
+    } else {
+        printf("[INFO]: chose machswap2!\n");
+        chosen_strategy = _machswap_pwn_strategy(); //chosen_strategy = _machswap_pwn_strategy();
+        return KERN_SUCCESS;
     }
 //    else if ([multi_path_versions containsObject:system_version]) {
 //
