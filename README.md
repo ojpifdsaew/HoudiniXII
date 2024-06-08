@@ -1,3 +1,7 @@
+# This is a fork of the original HoudiniXII
+The website has been shut down for it, and you cant download it anymore. But this repo has a download available (latest archived version) on the website.
+
+
 # Houdini (iOS 10 -> 10.3.2, iOS 11 -> 11.4.1 and 12 -> 12.1.2)
 This is not meant to be a full jailbreak. Abraham initially created it as a PoC (to learn about the iOS file system structure and how far we can modify the system without a full jailbreak) but then it turned into a project for everyone to use.
 
@@ -14,5 +18,6 @@ HoudiniX may make changes to your device that can be dangerous, use at your own 
 - [pwn20wnd](https://twitter.com/pwn20wnd) - machswap_pwn
 - [yasdf007](https://twitter.com/yasdf007) - Testing A12 support
 
+
 # Download
-[Download here](https://houdinix.conorthedev.com)
+You can download HoudiniXII [here](https://pages.github.com/).
