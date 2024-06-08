@@ -1,5 +1,5 @@
 # This is a fork of the original HoudiniXII
-The website has been shut down for it, and you cant download it anymore. But this repo has a download available (latest archived version) on the website.
+The website has been shut down for it, and you cant download it anymore. But this repo has a download available (latest archived version).
 
 
 # Houdini (iOS 10 -> 10.3.2, iOS 11 -> 11.4.1 and 12 -> 12.1.2)
